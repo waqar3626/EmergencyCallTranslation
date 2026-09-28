@@ -28,6 +28,16 @@
   color: #61dafb;
 }
 
+/* Home page banner: HeroBanner renders white text, so it needs a dark background. */
+.hero-section {
+  background: linear-gradient(135deg, #1f4e79 0%, #2e75b6 55%, #8e2c22 100%);
+}
+
+.hero-section .overlay {
+  padding: 96px 0;
+  background: rgba(0, 0, 0, 0.18);
+}
+
 @keyframes App-logo-spin {
   from {
     transform: rotate(0deg);
