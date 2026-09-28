@@ -1,4 +1,4 @@
-# Emergency Call Translation
+﻿# Emergency Call Translation
 
 An AI-based emergency communication platform for multilingual, real-time call translation. It helps emergency operators understand callers who speak **Urdu, Pashto, Punjabi or English**: the caller's speech is transcribed, translated to English and classified by emergency type (**Fire, Medical, Accident, Police**) so the operator can respond quickly.
 
@@ -9,7 +9,13 @@ Final Year Project by **Waqas Hussain**.
 ## Table of contents
 
 - [Features](#features)
-- [How it works](#how-it-works)
+- [System architecture](#system-architecture)
+  - [Architecture diagram](#architecture-diagram)
+  - [Components](#components)
+  - [Request flow: upload and record](#request-flow-upload-and-record)
+  - [Request flow: live translation](#request-flow-live-translation)
+  - [Deployment architecture](#deployment-architecture)
+- [How it works (processing pipeline)](#how-it-works-processing-pipeline)
 - [Tech stack](#tech-stack)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
@@ -35,7 +41,234 @@ Final Year Project by **Waqas Hussain**.
 | **Emergency classification** | Tags each call as Fire, Medical, Accident, Police or Unknown. |
 | **Contact form** | Visitors can send a message, which is stored in the database. |
 
-## How it works
+## System architecture
+
+The system is a **three-tier web application**:
+
+1. **Presentation tier:** a React single-page app in the browser. It captures audio (file, recording or live microphone) and shows results.
+2. **Application tier:** a FastAPI backend that runs the AI pipeline: speech recognition, language detection, translation and classification.
+3. **Data tier:** a SQLite database accessed through SQLAlchemy, a local cache of AI models, and external translation APIs.
+
+### Architecture diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Client: Web Browser"]
+        UI["React 19 SPA<br/>(React Router, Bootstrap 5)"]
+        MIC["MediaRecorder API<br/>(microphone capture)"]
+        AX["Axios<br/>(REST client)"]
+        WSC["WebSocket client"]
+        UI --- MIC
+        UI --- AX
+        UI --- WSC
+    end
+
+    subgraph Proxy["Nginx (frontend container, port 3000)"]
+        STATIC["Static React build"]
+        RP["Reverse proxy<br/>/api/* and /ws/*"]
+    end
+
+    subgraph Backend["FastAPI Backend (Uvicorn, port 8000)"]
+        direction TB
+        subgraph Routes["API layer: routes/"]
+            R1["POST /api/emergency/process"]
+            R2["WS /ws/live-transcription"]
+            R3["POST /api/contact/"]
+        end
+        subgraph Services["Service layer: services/"]
+            FS["file_service<br/>save upload (UUID name)"]
+            LS["live_speech_service<br/>per-call session state"]
+            STT["speech_service<br/>faster-whisper STT"]
+            LD["language_service<br/>language detection"]
+            TR["translation_service<br/>to English"]
+            CL["classification_service<br/>emergency type"]
+        end
+        subgraph Data["Data layer: models/, schemas/, config/"]
+            ORM["SQLAlchemy ORM<br/>+ Pydantic schemas"]
+        end
+    end
+
+    subgraph AI["AI Models (local, cached in HF_HOME)"]
+        WM["Whisper medium<br/>(upload / record)"]
+        WL["Whisper small<br/>(live)"]
+        MT["Helsinki-NLP MarianMT<br/>(offline fallback)"]
+    end
+
+    subgraph External["External translation APIs"]
+        GT["Google Translate"]
+        MM["MyMemory"]
+    end
+
+    DB[("SQLite<br/>emergency.db")]
+
+    UI --> STATIC
+    AX -- "HTTP multipart / JSON" --> RP
+    WSC -- "WebSocket (binary audio clips)" --> RP
+    RP --> R1
+    RP --> R2
+    RP --> R3
+
+    R1 --> FS --> STT
+    R2 --> LS --> STT
+    STT --> LD --> TR --> CL
+    R3 --> ORM --> DB
+
+    STT -.-> WM
+    STT -.-> WL
+    TR -.-> GT
+    TR -.-> MM
+    TR -.-> MT
+```
+
+<details>
+<summary><b>Plain-text version of the diagram</b> (for viewers that don't render Mermaid)</summary>
+
+```
++---------------------------- CLIENT (Web Browser) ----------------------------+
+|  React 19 SPA -- pages: Home | Upload File | Record Audio | Live | Contact    |
+|     MediaRecorder (mic)        Axios (REST)            WebSocket client       |
++-------------------------------------+-------------------------+--------------+
+                                      | HTTP (multipart/JSON)   | WS (binary clips)
++-------------------------------------v-------------------------v--------------+
+|              NGINX  (serves React build, proxies /api and /ws)               |
++-------------------------------------+-------------------------+--------------+
+                                      |                         |
++-------------------------------------v-------------------------v--------------+
+|                        FASTAPI BACKEND (Uvicorn :8000)                        |
+|                                                                               |
+|  ROUTES    POST /api/emergency/process   WS /ws/live-transcription            |
+|                 |                             |              POST /api/contact/
+|  SERVICES  file_service               live_speech_service          |          |
+|             (save upload)             (call session, queue)        |          |
+|                 +--------------+--------------+                    |          |
+|                                v                                  |          |
+|                   +-------------------------+   +---------------+  |          |
+|                   | speech_service          |-->| Whisper       |  |          |
+|                   | (speech-to-text)        |   | medium/small  |  |          |
+|                   +------------+------------+   +---------------+  |          |
+|                                v                                  |          |
+|                   +-------------------------+                      |          |
+|                   | language_service        |                      |          |
+|                   +------------+------------+                      |          |
+|                                v                                  |          |
+|                   +-------------------------+   +---------------+  |          |
+|                   | translation_service     |-->| Google        |  |          |
+|                   | (to English)            |   | MyMemory      |  |          |
+|                   +------------+------------+   | MarianMT      |  |          |
+|                                v                +---------------+  v          |
+|                   +-------------------------+          +----------------+     |
+|                   | classification_service  |          | SQLAlchemy ORM |     |
+|                   +-------------------------+          +-------+--------+     |
+|                                                                v              |
+|                                                        +----------------+     |
+|                                                        | SQLite DB      |     |
+|                                                        +----------------+     |
++-------------------------------------------------------------------------------+
+```
+
+</details>
+
+### Components
+
+| Layer | Component | File | Responsibility |
+|---|---|---|---|
+| Frontend | Pages | [`frontend/src/pages/`](frontend/src/pages) | `Home`, `UploadAudio`, `RecordAudio`, `LiveTranslation` and `ContactUs` screens. |
+| Frontend | Components | [`frontend/src/components/`](frontend/src/components) | Navbar, footer, hero banner and the `ResultCard` that shows a translation result. |
+| Frontend | API client | [`frontend/src/services/api.js`](frontend/src/services/api.js) | Axios instance. Chooses the backend URL for development or production. |
+| Proxy | Nginx | [`frontend/nginx.conf`](frontend/nginx.conf) | Serves the React build, forwards `/api/*` and upgrades `/ws/*` to WebSocket for the backend. |
+| Backend | App entry | [`backend/app/main.py`](backend/app/main.py) | Creates the FastAPI app, CORS, routers and database tables. |
+| Backend | Emergency route | [`routes/emergency_routes.py`](backend/app/routes/emergency_routes.py) | Receives an audio file and runs the pipeline in a worker thread. |
+| Backend | WebSocket route | [`routes/websocket_routes.py`](backend/app/routes/websocket_routes.py) | Receives live clips, decodes them, queues and merges them, and sends results back. |
+| Backend | Contact route | [`routes/contact_routes.py`](backend/app/routes/contact_routes.py) | Validates and stores contact-form messages. |
+| Service | Speech-to-text | [`services/speech_service.py`](backend/app/services/speech_service.py) | Loads Whisper, restricts detection to supported languages, adds the language hint, removes loops. |
+| Service | Live session | [`services/live_speech_service.py`](backend/app/services/live_speech_service.py) | Keeps the transcript and language of one live call. Re-translates the full call. |
+| Service | Language detection | [`services/language_service.py`](backend/app/services/language_service.py) | Maps Whisper codes and script features to Urdu, Pashto, Punjabi or English. |
+| Service | Translation | [`services/translation_service.py`](backend/app/services/translation_service.py) | Splits text into sentences, tries providers in order, validates and caches results. |
+| Service | Classification | [`services/classification_service.py`](backend/app/services/classification_service.py) | Keyword-based Fire, Medical, Accident or Police tagging (English, Urdu and Pashto keywords). |
+| Service | File storage | [`services/file_service.py`](backend/app/services/file_service.py) | Saves uploads under random UUID names; they are deleted after processing. |
+| Data | Models and schemas | [`models/`](backend/app/models), [`schemas/`](backend/app/schemas) | SQLAlchemy tables and Pydantic request/response models. |
+| Data | Database config | [`config/database.py`](backend/app/config/database.py) | Engine and session factory (`DATABASE_URL`, SQLite by default). |
+
+### Request flow: upload and record
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant FE as React frontend
+    participant API as FastAPI /api/emergency/process
+    participant STT as Whisper (medium)
+    participant TR as Translation service
+    participant G as Google / MyMemory
+
+    Op->>FE: Upload file or record call, choose language
+    FE->>API: POST multipart (audio, source_language)
+    API->>API: Save as UUID file
+    API->>STT: Transcribe (detect language if Auto)
+    STT-->>API: Urdu / Pashto / Punjabi / English text
+    API->>TR: Translate to English
+    TR->>G: Sentence groups
+    G-->>TR: English text
+    TR-->>API: Validated translation
+    API->>API: Classify emergency, delete audio file
+    API-->>FE: JSON result
+    FE-->>Op: Show transcript, language, translation, emergency type
+```
+
+### Request flow: live translation
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant FE as LiveTranslation page
+    participant WS as WebSocket /ws/live-transcription
+    participant S as LiveTranscriptionSession
+    participant STT as Whisper (small)
+    participant TR as Translation service
+
+    Op->>FE: Choose language, click "Translate Live"
+    FE->>WS: Connect ?language=Urdu
+    loop Every 5 seconds
+        FE->>WS: Binary WebM/Opus clip
+        WS->>WS: Decode to 16 kHz PCM, queue (merge if behind)
+        WS->>S: process_audio(clips)
+        S->>STT: Transcribe (locked language + recent context)
+        STT-->>S: New segment text
+        S->>TR: Translate the whole call so far (earlier sentences cached)
+        TR-->>S: Full English translation
+        S-->>WS: Full transcript, translation, emergency type
+        WS-->>FE: JSON update
+        FE-->>Op: Screen updates in place
+    end
+    Op->>FE: Stop
+    FE->>WS: Close connection
+```
+
+### Deployment architecture
+
+```mermaid
+flowchart LR
+    U["User browser"] -- "http://localhost:3000" --> F
+    subgraph DC["Docker Compose"]
+        F["frontend container<br/>nginx:1.27-alpine<br/>port 80 to 3000"]
+        B["backend container<br/>python:3.10-slim + Uvicorn<br/>port 8000"]
+        V1[("backend-data<br/>SQLite")]
+        V2[("backend-uploads")]
+        V3[("model-cache<br/>Whisper / MarianMT")]
+        F -- "/api, /ws proxy" --> B
+        B --- V1
+        B --- V2
+        B --- V3
+    end
+    B -- "HTTPS" --> T["Google Translate / MyMemory"]
+```
+
+- The **frontend** image is built in two stages: Node 22 builds the React app, then Nginx serves it.
+- The **backend** container has a health check, and the frontend only starts once the backend is healthy.
+- Three **named volumes** keep the database, uploads and downloaded models across restarts.
+
+## How it works (processing pipeline)
 
 ```mermaid
 flowchart LR
@@ -70,21 +303,38 @@ flowchart LR
 
 ## Tech stack
 
-**Backend**
-- Python 3.10, FastAPI, Uvicorn (REST + WebSocket)
-- faster-whisper (CTranslate2) for speech recognition
-- Hugging Face Transformers + PyTorch (MarianMT offline translation)
-- langdetect
-- SQLAlchemy + SQLite
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Frontend** | [React 19](https://react.dev/) (Create React App) | Single-page user interface |
+| | [React Router 6](https://reactrouter.com/) | Page routing |
+| | [Bootstrap 5](https://getbootstrap.com/) | Responsive layout and styling |
+| | [Axios](https://axios-http.com/) | HTTP requests to the REST API |
+| | MediaRecorder and WebSocket browser APIs | Microphone capture and live streaming |
+| **Backend** | [Python 3.10](https://www.python.org/) | Backend language |
+| | [FastAPI](https://fastapi.tiangolo.com/) | REST and WebSocket API framework |
+| | [Uvicorn](https://www.uvicorn.org/) | ASGI server |
+| | [Pydantic](https://docs.pydantic.dev/) | Request and response validation |
+| | python-multipart | Multipart file uploads |
+| **Speech recognition** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper on [CTranslate2](https://github.com/OpenNMT/CTranslate2)) | Multilingual speech-to-text on CPU (int8) |
+| | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg) | Decodes WebM, Opus, MP3, WAV, M4A and other formats |
+| | Silero VAD (built into faster-whisper) | Skips silence and background noise |
+| **Translation** | Google Translate web API | Main online translator |
+| | [MyMemory](https://mymemory.translated.net/) API | Online fallback |
+| | [Hugging Face Transformers](https://huggingface.co/docs/transformers) + [PyTorch](https://pytorch.org/): Helsinki-NLP MarianMT (`opus-mt-ur-en`, `opus-mt-pa-en`) | Offline fallback |
+| **NLP** | [langdetect](https://pypi.org/project/langdetect/) | Language detection from text |
+| | Rule-based keyword classifier (English, Urdu and Pashto) | Emergency type |
+| **Database** | [SQLAlchemy](https://www.sqlalchemy.org/) + SQLite | ORM and storage (MySQL is possible via `DATABASE_URL` and PyMySQL) |
+| **DevOps** | [Docker](https://www.docker.com/) and Docker Compose | Containerised deployment |
+| | [Nginx](https://nginx.org/) | Static hosting and reverse proxy |
 
-**Frontend**
-- React 19 (Create React App), React Router
-- Bootstrap 5
-- Axios, browser MediaRecorder and WebSocket APIs
+### Supported languages
 
-**Deployment**
-- Docker and Docker Compose
-- Nginx (serves the React build and proxies `/api` and `/ws` to the backend)
+| Language | Whisper code | Script handled | Translation source code |
+|---|---|---|---|
+| Urdu | `ur` (Hindi detections counted as Urdu) | Arabic (Nastaliq) | `ur` |
+| Pashto | `ps` (Persian and Arabic detections counted as Pashto) | Arabic, with Pashto-only letters | `ps` |
+| Punjabi | `pa` | Shahmukhi (Arabic) or Gurmukhi | `pa-Arab` or `pa` |
+| English | `en` | Latin | not translated |
 
 ## Project structure
 
@@ -138,7 +388,7 @@ EmergencyCallTranslation/
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/EmergencyCallTranslation.git
+git clone https://github.com/waqar3626/EmergencyCallTranslation.git
 cd EmergencyCallTranslation
 ```
 
