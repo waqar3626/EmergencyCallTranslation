@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+faster-whisper
+langdetect
+transformers
+torch
+scikit-learn
+sqlalchemy
+pymysql
+sentencepiece

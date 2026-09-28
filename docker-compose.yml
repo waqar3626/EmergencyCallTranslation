@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      DATABASE_URL: sqlite:////app/data/emergency.db
+      WHISPER_MODEL: medium
+      LIVE_WHISPER_MODEL: small
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend-data:/app/data
+      - backend-uploads:/app/backend/app/uploads
+      - model-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  backend-uploads:
+  model-cache:

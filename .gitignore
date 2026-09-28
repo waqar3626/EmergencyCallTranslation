@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Build output
+frontend/build/
+
+# Local data: SQLite database (contact form entries) and uploaded call audio
+*.db
+backend/app/uploads/*
+!backend/app/uploads/.gitkeep
+
+# Environment and logs
+.env
+.env.*
+*.log
+
+# Scratch files from manual testing
+/temp_test_upload.js
+/test.wav
+/test.webm
+/package.json
+/package-lock.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
