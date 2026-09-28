@@ -10,6 +10,9 @@ __pycache__/
 # Build output
 frontend/build/
 
+# Thesis
+thesis/
+
 # Local data: SQLite database (contact form entries) and uploaded call audio
 *.db
 backend/app/uploads/*
