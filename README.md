@@ -1,4 +1,4 @@
-﻿# Emergency Call Translation
+# Emergency Call Translation
 
 An AI-based emergency communication platform for multilingual, real-time call translation. It helps emergency operators understand callers who speak **Urdu, Pashto, Punjabi or English**: the caller's speech is transcribed, translated to English and classified by emergency type (**Fire, Medical, Accident, Police**) so the operator can respond quickly.
 
