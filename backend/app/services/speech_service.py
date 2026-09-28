@@ -94,10 +94,14 @@ def _collapse_repetitions(text: str):
             repeats = 1
             while words[index + repeats * size:index + (repeats + 1) * size] == phrase:
                 repeats += 1
-            # Allow a phrase to be said twice ("jaldi jaldi"), drop the rest.
-            keep = min(repeats, 2) if len(phrase) == size else 1
-            collapsed.extend(phrase * keep)
-            index += size * repeats
+            if repeats > 1:
+                # Allow a phrase to be said twice ("jaldi jaldi"), drop the rest.
+                collapsed.extend(phrase * 2)
+                index += size * repeats
+            else:
+                # Advance one word so repeats starting mid-phrase are found.
+                collapsed.append(words[index])
+                index += 1
         words = collapsed
     return " ".join(words)
 
