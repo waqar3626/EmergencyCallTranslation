@@ -5,8 +5,18 @@ services:
     environment:
       HF_HOME: /root/.cache/huggingface
       DATABASE_URL: sqlite:////app/data/emergency.db
+      # Speech recognition: general (Punjabi, English), Urdu, Pashto, live
       WHISPER_MODEL: medium
+      URDU_ASR_MODEL: kingabzpro/whisper-large-v3-urdu-ct2
+      PASHTO_ASR_MODEL: ihanif/pashto-asr-v3
       LIVE_WHISPER_MODEL: small
+      LIVE_PARTIAL_MODEL: base
+      # Offline translation (Meta NLLB-200, int8)
+      NLLB_MODEL: OpenNMT/nllb-200-distilled-1.3B-ct2-int8
+      # Plain HTTP downloads; the Xet transfer can stall on large files
+      HF_HUB_DISABLE_XET: "1"
+      # Return freed memory to the system (the models need ~5 GB together)
+      MALLOC_ARENA_MAX: "2"
     ports:
       - "8000:8000"
     volumes:
@@ -18,7 +28,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 20s
+      start_period: 30s
     restart: unless-stopped
 
   frontend:

@@ -2,11 +2,14 @@ fastapi
 uvicorn[standard]
 websockets
 python-multipart
-faster-whisper
 langdetect
-transformers
-torch
 scikit-learn
 sqlalchemy
 pymysql
 sentencepiece
+# Speech and translation models: versions tested together
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+transformers==5.8.0
+huggingface_hub==1.14.0
+torch

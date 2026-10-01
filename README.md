@@ -89,12 +89,13 @@ flowchart TB
     end
 
     subgraph AI["AI Models (local, cached in HF_HOME)"]
-        WM["Whisper medium<br/>(upload / record)"]
-        WL["Whisper small<br/>(live)"]
-        MT["Helsinki-NLP MarianMT<br/>(offline fallback)"]
+        WM["Whisper large-v3-turbo Urdu<br/>(upload / record)"]
+        WP["w2v-BERT 2.0 Pashto<br/>(all modes)"]
+        WL["Whisper small / base<br/>(live, language detection)"]
+        MT["NLLB-200 1.3B<br/>(offline translation)"]
     end
 
-    subgraph External["External translation APIs"]
+    subgraph External["Optional online fallback"]
         GT["Google Translate"]
         MM["MyMemory"]
     end
@@ -152,9 +153,9 @@ flowchart TB
 |                   +------------+------------+                      |          |
 |                                v                                  |          |
 |                   +-------------------------+   +---------------+  |          |
-|                   | translation_service     |-->| Google        |  |          |
-|                   | (to English)            |   | MyMemory      |  |          |
-|                   +------------+------------+   | MarianMT      |  |          |
+|                   | translation_service     |-->| NLLB-200      |  |          |
+|                   | (to English)            |   | (offline)     |  |          |
+|                   +------------+------------+   | + online opt. |  |          |
 |                                v                +---------------+  v          |
 |                   +-------------------------+          +----------------+     |
 |                   | classification_service  |          | SQLAlchemy ORM |     |
@@ -197,9 +198,9 @@ sequenceDiagram
     actor Op as Operator
     participant FE as React frontend
     participant API as FastAPI /api/emergency/process
-    participant STT as Whisper (medium)
+    participant STT as Speech models (Urdu turbo / Pashto w2v-BERT)
     participant TR as Translation service
-    participant G as Google / MyMemory
+    participant G as NLLB-200 (local)
 
     Op->>FE: Upload file or record call, choose language
     FE->>API: POST multipart (audio, source_language)
@@ -221,28 +222,31 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     actor Op as Operator
-    participant FE as LiveTranslation page
+    participant FE as LiveTranslation page (AudioWorklet)
     participant WS as WebSocket /ws/live-transcription
-    participant S as LiveTranscriptionSession
-    participant STT as Whisper (small)
-    participant TR as Translation service
+    participant S as LiveSession (Silero VAD + worker)
+    participant STT as Speech models
+    participant TR as NLLB-200
 
-    Op->>FE: Choose language, click "Translate Live"
-    FE->>WS: Connect ?language=Urdu
-    loop Every 5 seconds
-        FE->>WS: Binary WebM/Opus clip
-        WS->>WS: Decode to 16 kHz PCM, queue (merge if behind)
-        WS->>S: process_audio(clips)
-        S->>STT: Transcribe (locked language + recent context)
-        STT-->>S: New segment text
-        S->>TR: Translate the whole call so far (earlier sentences cached)
-        TR-->>S: Full English translation
-        S-->>WS: Full transcript, translation, emergency type
-        WS-->>FE: JSON update
-        FE-->>Op: Screen updates in place
+    Op->>FE: Choose language, click "Start live translation"
+    FE->>WS: Connect ?language=Pashto
+    loop Every 100 ms while the microphone is on
+        FE->>WS: 16 kHz PCM block
+        WS->>S: feed(pcm) - voice activity detection
     end
+    Note over S: Speech starts: status "speaking"
+    loop Every ~1.2 s while the caller talks
+        S->>STT: Fast transcription of the current sentence
+        STT-->>S: Partial text
+        S-->>FE: partial (text, quick translation when the CPU is free)
+    end
+    Note over S: 0.7 s pause: sentence finished
+    S->>STT: Final transcription
+    S->>TR: Translate (full quality)
+    S-->>FE: final (text, translation, emergency type)
+    Note over S: Silence: status "listening", nothing is processed
     Op->>FE: Stop
-    FE->>WS: Close connection
+    FE->>WS: {"type": "stop"} - last sentence is finished, then the socket closes
 ```
 
 ### Deployment architecture
@@ -255,13 +259,13 @@ flowchart LR
         B["backend container<br/>python:3.10-slim + Uvicorn<br/>port 8000"]
         V1[("backend-data<br/>SQLite")]
         V2[("backend-uploads")]
-        V3[("model-cache<br/>Whisper / MarianMT")]
+        V3[("model-cache<br/>speech + NLLB models")]
         F -- "/api, /ws proxy" --> B
         B --- V1
         B --- V2
         B --- V3
     end
-    B -- "HTTPS" --> T["Google Translate / MyMemory"]
+    B -. "optional HTTPS fallback" .-> T["Google Translate / MyMemory"]
 ```
 
 - The **frontend** image is built in two stages: Node 22 builds the React app, then Nginx serves it.
@@ -273,33 +277,40 @@ flowchart LR
 ```mermaid
 flowchart LR
     A[Browser<br/>upload / record / live mic] -->|audio| B[FastAPI backend]
-    B --> C[Speech-to-text<br/>faster-whisper]
-    C --> D[Language detection]
-    D --> E[Translation to English<br/>Google → MyMemory → offline MarianMT]
+    B --> L[Language detection<br/>Whisper small + rules]
+    L -->|Urdu| U[Whisper large-v3-turbo<br/>fine-tuned on Urdu]
+    L -->|Pashto| P[w2v-BERT 2.0<br/>fine-tuned on Pashto]
+    L -->|Punjabi / English| W[Whisper medium]
+    U & P & W --> E[NLLB-200 1.3B<br/>offline translation]
     E --> F[Emergency classification]
     F -->|JSON result| A
 ```
 
-1. **Speech-to-text** ([`speech_service.py`](backend/app/services/speech_service.py))
-   Audio is transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), an optimized OpenAI Whisper implementation that runs on CPU.
-   - Whisper's language guess is limited to the supported languages. Its Hindi score is counted towards Urdu, since spoken Urdu and Hindi are nearly identical, and its Persian and Arabic scores are counted towards Pashto. The audio is then transcribed with that language locked. This stops Urdu calls from coming out in Hindi (Devanagari) script, which cannot be translated.
-   - A short in-language example emergency call is given to Whisper as context, so it uses the correct script and spelling for common emergency words (گھر، آگ، حادثہ، ایمبولینس …).
-   - When a transcript starts looping, Whisper retries at a slightly higher temperature, and any looping text left over is removed.
+1. **Language detection** ([`speech_service.py`](backend/app/services/speech_service.py))
+   Whisper's language scores are summed over related languages: spoken Urdu is usually labelled *Hindi*, and Pashto is often labelled Persian, Arabic or even Marathi. The rule is: English if its score is at least 0.5, Urdu if the Urdu group is at least 0.7, Punjabi if it is at least 0.5, otherwise Pashto. On 30 FLEURS test recordings this identified **15/15 Urdu and 15/15 Pashto** clips, compared with 2/15 and 10/15 for Whisper's own guess. Choosing the language in the interface skips detection.
 
-2. **Language detection** ([`language_service.py`](backend/app/services/language_service.py)): uses Whisper's language, Pashto-only letters (ټ ډ ړ ږ ښ ګ ځ څ ې), Gurmukhi script and `langdetect` as a fallback.
+2. **Speech-to-text**: the best CPU-friendly model for each language.
+
+   | Language | Model | Word error rate (15 FLEURS clips) |
+   |---|---|---|
+   | Urdu | [`kingabzpro/whisper-large-v3-urdu-ct2`](https://huggingface.co/kingabzpro/whisper-large-v3-urdu-ct2), Whisper large-v3-turbo fine-tuned on Urdu | **24.9%** (generic Whisper small: 34.5%) |
+   | Pashto | [`ihanif/pashto-asr-v3`](https://huggingface.co/ihanif/pashto-asr-v3), w2v-BERT 2.0 fine-tuned on Pashto | **19.0%** (generic Whisper small: 92.0%) |
+   | Punjabi, English | Whisper `medium` | not measured |
+
+   Off-the-shelf Whisper cannot recognise Pashto: published zero-shot word error rates are above 100%, and it writes Urdu or Arabic script ([Benchmarking Multilingual Speech Models on Pashto](https://arxiv.org/abs/2604.04598)). The Pashto model is a CTC model, so it cannot fall into Whisper's repetition loops, and it is fast on a CPU (int8). No prompts are given to Whisper, because on unclear audio Whisper repeats the prompt text back.
 
 3. **Translation** ([`translation_service.py`](backend/app/services/translation_service.py))
-   - Long text is split into sentence groups. Each group is translated by the first provider that returns a real English result: **Google Translate**, then Google with auto-detect, then **MyMemory**, then an **offline Helsinki-NLP MarianMT** model (Urdu and Punjabi).
-   - Punjabi in Shahmukhi (Arabic script) is sent as `pa-Arab`. With plain `pa` the providers only transliterate it.
-   - If every provider fails, the text is marked `[Translation unavailable]` and the original is shown. The system never makes up a translation.
+   - [Meta NLLB-200](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) (1.3B, int8, CTranslate2) runs **locally**: no rate limits, no internet needed, and call text stays on the server. It handles Urdu (`urd_Arab`), Pashto (`pbt_Arab`) and Punjabi in Shahmukhi (`pnb_Arab`) or Gurmukhi (`pan_Guru`).
+   - Google Translate and MyMemory are only an optional fallback (`ONLINE_TRANSLATION_FALLBACK=1`). After Google answers *429 Too Many Requests* it is skipped for 10 minutes.
+   - If translation fails, the text is marked `[Translation unavailable]` and the original is shown. The system never makes up a translation.
 
 4. **Classification** ([`classification_service.py`](backend/app/services/classification_service.py)): keyword matching on the English translation and the original text.
 
-5. **Live mode** ([`live_speech_service.py`](backend/app/services/live_speech_service.py), [`websocket_routes.py`](backend/app/routes/websocket_routes.py))
-   - The browser sends a self-contained 5-second WebM/Opus clip over the WebSocket.
-   - The server keeps the whole call's transcript. After each clip it re-translates the full call, so the translation has sentence context. Earlier sentences come from a cache, so only the new part is sent to the translator.
-   - The language detected in the first clip is kept for the rest of the call.
-   - If the CPU falls behind real time, queued clips are merged into a single transcription pass.
+5. **Live mode** ([`live_speech_service.py`](backend/app/services/live_speech_service.py), [`websocket_routes.py`](backend/app/routes/websocket_routes.py), [`pcm-recorder-worklet.js`](frontend/public/pcm-recorder-worklet.js))
+   - The browser streams the microphone continuously as 16 kHz PCM in 100 ms blocks.
+   - The Silero voice activity detector finds where speech starts and stops. While the caller speaks, a fast model sends **partial text** about every 1.2 s, with a quick translation when the CPU is free. After a **0.7 s pause** the sentence is transcribed again, translated with full quality and added to the call.
+   - During silence nothing is processed, so the session simply waits. There are no fixed-length clips and no timeouts.
+   - One worker per call: finished sentences always take priority and out-of-date partial results are dropped, so the delay cannot build up.
 
 ## Tech stack
 
@@ -315,12 +326,13 @@ flowchart LR
 | | [Uvicorn](https://www.uvicorn.org/) | ASGI server |
 | | [Pydantic](https://docs.pydantic.dev/) | Request and response validation |
 | | python-multipart | Multipart file uploads |
-| **Speech recognition** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper on [CTranslate2](https://github.com/OpenNMT/CTranslate2)) | Multilingual speech-to-text on CPU (int8) |
+| **Speech recognition** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper on [CTranslate2](https://github.com/OpenNMT/CTranslate2)) | Urdu (fine-tuned large-v3-turbo), Punjabi, English, live mode, language detection |
+| | [Transformers](https://huggingface.co/docs/transformers) + [PyTorch](https://pytorch.org/) (CPU): w2v-BERT 2.0 fine-tuned on Pashto | Pashto speech recognition |
 | | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg) | Decodes WebM, Opus, MP3, WAV, M4A and other formats |
-| | Silero VAD (built into faster-whisper) | Skips silence and background noise |
-| **Translation** | Google Translate web API | Main online translator |
-| | [MyMemory](https://mymemory.translated.net/) API | Online fallback |
-| | [Hugging Face Transformers](https://huggingface.co/docs/transformers) + [PyTorch](https://pytorch.org/): Helsinki-NLP MarianMT (`opus-mt-ur-en`, `opus-mt-pa-en`) | Offline fallback |
+| | Silero VAD (built into faster-whisper) | Skips silence; detects speech start/end in live mode |
+| | Web Audio API AudioWorklet | Streams the microphone as 16 kHz PCM |
+| **Translation** | [Meta NLLB-200](https://ai.meta.com/research/no-language-left-behind/) 1.3B (int8, CTranslate2) | Offline translation to English |
+| | Google Translate / [MyMemory](https://mymemory.translated.net/) | Optional online fallback |
 | **NLP** | [langdetect](https://pypi.org/project/langdetect/) | Language detection from text |
 | | Rule-based keyword classifier (English, Urdu and Pashto) | Emergency type |
 | **Database** | [SQLAlchemy](https://www.sqlalchemy.org/) + SQLite | ORM and storage (MySQL is possible via `DATABASE_URL` and PyMySQL) |
@@ -329,11 +341,11 @@ flowchart LR
 
 ### Supported languages
 
-| Language | Whisper code | Script handled | Translation source code |
+| Language | Whisper code | Script handled | NLLB source code |
 |---|---|---|---|
-| Urdu | `ur` (Hindi detections counted as Urdu) | Arabic (Nastaliq) | `ur` |
-| Pashto | `ps` (Persian and Arabic detections counted as Pashto) | Arabic, with Pashto-only letters | `ps` |
-| Punjabi | `pa` | Shahmukhi (Arabic) or Gurmukhi | `pa-Arab` or `pa` |
+| Urdu | `ur` (Hindi detections counted as Urdu) | Arabic (Nastaliq) | `urd_Arab` |
+| Pashto | `ps` (Persian and Arabic detections counted as Pashto) | Arabic, with Pashto-only letters | `pbt_Arab` |
+| Punjabi | `pa` | Shahmukhi (Arabic) or Gurmukhi | `pnb_Arab` or `pan_Guru` |
 | English | `en` | Latin | not translated |
 
 ## Project structure
@@ -381,7 +393,7 @@ EmergencyCallTranslation/
 ### Prerequisites
 
 - **Internet connection** on first run (to download the Whisper models, about 0.5 to 1.5 GB) and for the online translation providers.
-- At least **8 GB RAM** is recommended (the `medium` Whisper model uses about 2 to 3 GB).
+- At least **16 GB RAM** is recommended: the speech and translation models use about 5 GB together. The first start downloads about 5 GB of models.
 - For Docker: [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 - For local setup: **Python 3.10+**, **Node.js 18+** (22 recommended) and **Git**.
 
@@ -453,7 +465,7 @@ The app opens at <http://localhost:3000>. In development it calls the backend at
 
 1. **Upload File**: choose an audio file, pick the source language (or *Detect automatically*) and click **Translate Audio**.
 2. **Record Audio**: allow microphone access, click **Start Recording**, speak, **Stop Recording**, then **Submit Audio for Translation**.
-3. **Live Translation**: pick the source language, click **Translate Live** and speak. The transcript and translation of the whole call update every ~5 seconds. Click **Stop Live Translate** to end.
+3. **Live Translation**: pick the source language, click **Start live translation** and speak. Your words appear (grey) while you talk; after each pause the sentence and its English translation are added. The status light shows *Listening*, *Hearing speech* or *Translating*. Click **Stop** to finish the last sentence and end.
 4. **Contact Us**: send a message to the project team.
 
 > **Tip:** Choosing the caller's language instead of *Detect automatically* gives the most accurate results, especially for Pashto and Punjabi.
@@ -466,8 +478,15 @@ Backend environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `WHISPER_MODEL` | `medium` | Whisper model for uploads/recordings (`base`, `small`, `medium`, `large-v3`). Larger = more accurate but slower. |
-| `LIVE_WHISPER_MODEL` | `small` | Whisper model for live translation. It must be fast enough to keep up with real-time audio. |
+| `URDU_ASR_MODEL` | `kingabzpro/whisper-large-v3-urdu-ct2` | Urdu speech model for uploads and recordings. |
+| `PASHTO_ASR_MODEL` | `ihanif/pashto-asr-v3` | Pashto speech model (all modes). A Hugging Face ID or a local folder. |
+| `WHISPER_MODEL` | `medium` | Whisper model for Punjabi and English uploads/recordings. |
+| `LIVE_WHISPER_MODEL` | `small` | Whisper model for finished sentences in live mode (Urdu, Punjabi, English). |
+| `LIVE_PARTIAL_MODEL` | `base` | Fastest Whisper model, for the interim text shown while the caller talks. |
+| `LID_WHISPER_MODEL` | same as `LIVE_WHISPER_MODEL` | Whisper model used to detect the spoken language. |
+| `NLLB_MODEL` | `OpenNMT/nllb-200-distilled-1.3B-ct2-int8` | Offline translation model. |
+| `ONLINE_TRANSLATION_FALLBACK` | `1` | Use Google Translate / MyMemory if NLLB is unavailable (`0` = never send text online). |
+| `PRELOAD_MODELS` | `1` | Load all models in the background at start-up. |
 | `DATABASE_URL` | `sqlite:///./emergency.db` | SQLAlchemy database URL. |
 | `HF_HOME` | Hugging Face default | Where downloaded models are cached. |
 
@@ -532,7 +551,8 @@ JSON body: `phone`, `email`, `title`, `message`, `address`. Stores the message a
 | First request is very slow | The Whisper model is downloading and loading. Later requests are much faster. |
 | `Unable to contact the backend server` | Make sure the backend is running on port 8000 (`python run.py` or `docker compose ps`). |
 | Microphone does not work | Allow microphone permission in the browser and use `localhost` or `https://`. |
-| Live translation lags behind | Use a smaller live model, for example `LIVE_WHISPER_MODEL=base`. |
+| Live translation is slow | Plug the laptop in: on battery, Windows throttles the CPU (we measured 31% speed), which makes every model about 3x slower. Or use smaller models, for example `LIVE_WHISPER_MODEL=base`. |
+| Pashto is shown as Urdu | Select **Pashto** as the source language instead of *Detect automatically*. |
 | `[Translation unavailable]` in results | The online translation services could not be reached. Check the internet connection. |
 | Out-of-memory errors | Use a smaller model: `WHISPER_MODEL=small`. |
 
@@ -545,7 +565,7 @@ JSON body: `phone`, `email`, `title`, `message`, `address`. Stores the message a
 
 ## Privacy note
 
-Uploaded audio is deleted from the server as soon as it has been processed. Transcribed text is sent to third-party translation services (Google Translate and MyMemory). For a real deployment with sensitive call data, replace them with a self-hosted translation model.
+Uploaded audio is deleted from the server as soon as it has been processed. Speech recognition and translation run locally, so call audio and text stay on the server. Text is only sent to Google Translate or MyMemory if the local translation model is unavailable; set `ONLINE_TRANSLATION_FALLBACK=0` to prevent that entirely.
 
 ---
 

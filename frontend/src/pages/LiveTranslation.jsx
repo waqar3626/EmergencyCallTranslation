@@ -1,293 +1,212 @@
 import { useEffect, useRef, useState } from 'react';
 
-// Each clip is a complete WebM file the backend can decode on its own.
-const SEGMENT_MS = 5000;
+// The microphone is streamed continuously as 16 kHz PCM (see
+// public/pcm-recorder-worklet.js). The server detects when the caller speaks
+// and pauses, sends partial text while they talk and a final, translated
+// sentence after each pause.
 
-const combineResults = (previous, current) => {
-  if (!previous) return current;
-  const join = (a, b) => [a, b].filter(Boolean).join(' ').trim();
-  return {
-    original_text: join(previous.original_text, current.original_text),
-    detected_language: current.detected_language || previous.detected_language,
-    translated_text: join(previous.translated_text, current.translated_text),
-    emergency_type: current.emergency_type !== 'Unknown' ? current.emergency_type : previous.emergency_type,
-  };
+const STATUS = {
+  idle: { label: 'Not started', className: 'bg-secondary' },
+  connecting: { label: 'Connecting…', className: 'bg-secondary' },
+  listening: { label: 'Listening — speak now', className: 'bg-success' },
+  speaking: { label: 'Hearing speech…', className: 'bg-danger' },
+  processing: { label: 'Translating…', className: 'bg-warning text-dark' },
+  reconnecting: { label: 'Reconnecting…', className: 'bg-secondary' },
 };
 
+const websocketBase = () => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return process.env.REACT_APP_WS_URL || (
+    process.env.NODE_ENV === 'production'
+      ? `${protocol}//${window.location.host}`
+      : `${protocol}//${window.location.hostname}:8000`
+  );
+};
+
+const formatTime = (seconds) =>
+  `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+
 function LiveTranslation() {
-  const [liveResult, setLiveResult] = useState(null);
-  const [isLive, setIsLive] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [error, setError] = useState('');
   const [sourceLanguage, setSourceLanguage] = useState('Auto');
+  const [isLive, setIsLive] = useState(false);
+  const [status, setStatus] = useState('idle');
+  const [segments, setSegments] = useState([]);
+  const [partial, setPartial] = useState(null);
+  const [emergencyType, setEmergencyType] = useState('Unknown');
+  const [detectedLanguage, setDetectedLanguage] = useState('');
+  const [elapsed, setElapsed] = useState(0);
+  const [error, setError] = useState('');
 
-  const mediaRecorderRef = useRef(null);
   const socketRef = useRef(null);
-  const timerRef = useRef(null);
-  const segmentTimerRef = useRef(null);
+  const audioContextRef = useRef(null);
   const streamRef = useRef(null);
-  const manualStopRef = useRef(false);
-  const reconnectAttemptsRef = useRef(0);
-  const maxReconnectAttemptsRef = useRef(3);
-  const pingIntervalRef = useRef(null);
-  // Bumped on every (re)connection so recorders from an old connection stop.
-  const connectionIdRef = useRef(0);
-  // The backend keeps the transcript per connection; keep what earlier
-  // connections produced so a reconnect doesn't wipe the screen.
-  const earlierResultRef = useRef(null);
-  const currentResultRef = useRef(null);
+  const workletRef = useRef(null);
+  const timerRef = useRef(null);
+  const pingRef = useRef(null);
+  const liveRef = useRef(false);
+  const reconnectsRef = useRef(0);
+  const transcriptEndRef = useRef(null);
 
-  const createMediaRecorder = (stream) => {
-    const connectionId = connectionIdRef.current;
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType: 'audio/webm;codecs=opus'
-    });
-
-    mediaRecorder.ondataavailable = (event) => {
-      console.log('Data available, size:', event.data.size);
-      if (!event.data || event.data.size < 1000) {
-        console.log('Skipping small audio chunk');
-        return;
-      }
-
-      const socket = socketRef.current;
-      if (socket?.readyState === WebSocket.OPEN) {
-        console.log('Sending audio segment to server, size:', event.data.size);
-        socket.send(event.data);
-      } else {
-        console.warn('Socket not open, audio segment not sent', socket?.readyState);
-      }
-    };
-
-    mediaRecorder.onerror = (event) => {
-      console.error('MediaRecorder error:', event.error);
-      setError('MediaRecorder error: ' + event.error.message);
-    };
-
-    mediaRecorder.onstop = () => {
-      if (segmentTimerRef.current) {
-        clearTimeout(segmentTimerRef.current);
-        segmentTimerRef.current = null;
-      }
-      if (!manualStopRef.current && streamRef.current === stream && connectionIdRef.current === connectionId) {
-        const nextRecorder = createMediaRecorder(stream);
-        mediaRecorderRef.current = nextRecorder;
-        startRecorderSegment(nextRecorder);
-      }
-    };
-
-    return mediaRecorder;
-  };
-
-  const startRecorderSegment = (mediaRecorder) => {
-    mediaRecorder.start();
-    segmentTimerRef.current = window.setTimeout(() => {
-      if (!manualStopRef.current && mediaRecorderRef.current === mediaRecorder && mediaRecorder.state === 'recording') {
-        mediaRecorder.stop();
-      }
-    }, SEGMENT_MS);
-  };
+  useEffect(() => () => stopEverything(), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    return () => {
-      manualStopRef.current = true;
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
+    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [segments, partial]);
+
+  const handleMessage = (event) => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (message.type === 'status') {
+      setStatus(message.state);
+    } else if (message.type === 'partial') {
+      setPartial((previous) => ({
+        id: message.id,
+        text: message.text,
+        // Keep the previous quick translation until a newer one arrives.
+        translation: message.translation ?? (previous?.id === message.id ? previous.translation : ''),
+      }));
+      if (message.detected_language) setDetectedLanguage(message.detected_language);
+    } else if (message.type === 'final') {
+      setPartial((previous) => (previous?.id === message.id ? null : previous));
+      if (message.text) {
+        setSegments((previous) => [...previous, {
+          id: `${Date.now()}-${message.id}`,
+          text: message.text,
+          translation: message.translation,
+        }]);
+        setDetectedLanguage(message.detected_language || '');
+        setEmergencyType(message.emergency_type || 'Unknown');
       }
-      if (pingIntervalRef.current) {
-        clearInterval(pingIntervalRef.current);
-      }
-      if (segmentTimerRef.current) {
-        clearTimeout(segmentTimerRef.current);
-      }
-      if (mediaRecorderRef.current?.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
-      if (socketRef.current) {
-        socketRef.current.close();
+    } else if (message.type === 'error') {
+      setError(message.message);
+    }
+  };
+
+  const connect = () => {
+    const query = new URLSearchParams({ language: sourceLanguage });
+    const socket = new WebSocket(`${websocketBase()}/ws/live-transcription?${query}`);
+    socket.binaryType = 'arraybuffer';
+    socketRef.current = socket;
+    setStatus(reconnectsRef.current ? 'reconnecting' : 'connecting');
+
+    socket.onopen = () => {
+      reconnectsRef.current = 0;
+      setError('');
+    };
+    socket.onmessage = handleMessage;
+    socket.onclose = () => {
+      if (socketRef.current !== socket || !liveRef.current) return;
+      // Unexpected close while live: reconnect, keeping the transcript on screen.
+      if (reconnectsRef.current < 5) {
+        reconnectsRef.current += 1;
+        setStatus('reconnecting');
+        setTimeout(() => liveRef.current && connect(), 1000 * reconnectsRef.current);
+      } else {
+        setError('Lost the connection to the server. Please press Start again.');
+        stopEverything();
       }
     };
-  }, []);
-
-  const connectWebSocket = (stream, mediaRecorder) => {
-    try {
-      const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const websocketHost = process.env.REACT_APP_WS_URL || (
-        process.env.NODE_ENV === 'production'
-          ? `${websocketProtocol}//${window.location.host}`
-          : `${websocketProtocol}//${window.location.hostname}:8000`
-      );
-      const query = new URLSearchParams({ language: sourceLanguage });
-      const socket = new WebSocket(`${websocketHost}/ws/live-transcription?${query}`);
-      socketRef.current = socket;
-
-      socket.onopen = () => {
-        console.log('WebSocket connected');
-        reconnectAttemptsRef.current = 0;
-        manualStopRef.current = false;
-        setIsLive(true);
-        setError('');
-        if (timerRef.current) {
-          clearInterval(timerRef.current);
-        }
-        timerRef.current = window.setInterval(() => {
-          setElapsedSeconds((prev) => prev + 1);
-        }, 1000);
-
-        // Start MediaRecorder only after WebSocket is connected
-        try {
-          startRecorderSegment(mediaRecorder);
-          console.log('MediaRecorder started');
-        } catch (recorderError) {
-          console.error('Failed to start MediaRecorder:', recorderError);
-          setError('Failed to start audio recording: ' + recorderError.message);
-        }
-
-        // Send a ping every 30 seconds to keep connection alive
-        if (pingIntervalRef.current) {
-          clearInterval(pingIntervalRef.current);
-        }
-        pingIntervalRef.current = setInterval(() => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 30000);
-      };
-
-      socket.onmessage = (event) => {
-        let data;
-        try {
-          data = JSON.parse(event.data);
-        } catch (parseError) {
-          console.warn('Ignoring non-JSON WebSocket message:', event.data);
-          return;
-        }
-        if (data.type === 'pong' || !data.original_text?.trim()) {
-          return;
-        }
-        // The backend sends the whole call so far, translated with full
-        // sentence context, so replace rather than append.
-        currentResultRef.current = data;
-        setLiveResult(combineResults(earlierResultRef.current, data));
-      };
-
-      socket.onerror = (error) => {
-        console.log('WebSocket error:', error);
-        setError('Live translation socket error. Attempting to reconnect...');
-      };
-
-      socket.onclose = (event) => {
-        console.log('WebSocket closed:', event.code, event.reason);
-        if (!manualStopRef.current) {
-          // Retire this connection's recorder before a new one is created.
-          connectionIdRef.current += 1;
-          if (segmentTimerRef.current) {
-            clearTimeout(segmentTimerRef.current);
-            segmentTimerRef.current = null;
-          }
-          if (mediaRecorderRef.current?.state === 'recording') {
-            mediaRecorderRef.current.stop();
-          }
-          if (currentResultRef.current) {
-            earlierResultRef.current = combineResults(earlierResultRef.current, currentResultRef.current);
-            currentResultRef.current = null;
-          }
-          if (reconnectAttemptsRef.current < maxReconnectAttemptsRef.current) {
-            reconnectAttemptsRef.current += 1;
-            setError(`Connection lost. Reconnecting... (Attempt ${reconnectAttemptsRef.current}/${maxReconnectAttemptsRef.current})`);
-            setTimeout(() => {
-              if (streamRef.current && !manualStopRef.current) {
-                // Create new MediaRecorder for reconnection
-                const mediaRecorder = createMediaRecorder(streamRef.current);
-                mediaRecorderRef.current = mediaRecorder;
-
-                connectWebSocket(streamRef.current, mediaRecorder);
-              }
-            }, 2000 * reconnectAttemptsRef.current);
-          } else {
-            setError('Live translation ended unexpectedly. Maximum reconnection attempts reached. Please restart.');
-            setIsLive(false);
-          }
-        }
-        if (timerRef.current) {
-          clearInterval(timerRef.current);
-          timerRef.current = null;
-        }
-      };
-
-      return socket;
-    } catch (err) {
-      console.error('Failed to create WebSocket:', err);
-      setError('Failed to connect to live translation server. Please try again.');
-      return null;
-    }
   };
 
   const startLive = async () => {
     setError('');
-    setLiveResult(null);
-    setElapsedSeconds(0);
-    reconnectAttemptsRef.current = 0;
-    manualStopRef.current = false;
-    connectionIdRef.current += 1;
-    earlierResultRef.current = null;
-    currentResultRef.current = null;
-
+    setSegments([]);
+    setPartial(null);
+    setEmergencyType('Unknown');
+    setDetectedLanguage('');
+    setElapsed(0);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       streamRef.current = stream;
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      await audioContext.audioWorklet.addModule(`${process.env.PUBLIC_URL || ''}/pcm-recorder-worklet.js`);
+      const source = audioContext.createMediaStreamSource(stream);
+      const worklet = new AudioWorkletNode(audioContext, 'pcm-recorder');
+      worklet.port.onmessage = ({ data }) => {
+        const socket = socketRef.current;
+        if (socket?.readyState === WebSocket.OPEN) socket.send(data);
+      };
+      source.connect(worklet);
+      workletRef.current = worklet;
 
-      const mediaRecorder = createMediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      console.log('MediaRecorder created with mimeType:', mediaRecorder.mimeType);
-
-      const socket = connectWebSocket(stream, mediaRecorder);
-      if (!socket) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-
-      // MediaRecorder will be started in socket.onopen
-
+      liveRef.current = true;
+      reconnectsRef.current = 0;
+      setIsLive(true);
+      connect();
+      timerRef.current = setInterval(() => setElapsed((value) => value + 1), 1000);
+      pingRef.current = setInterval(() => {
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+          socketRef.current.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 20000);
     } catch (err) {
       setError('Unable to start live translation. Please allow microphone access and try again.');
+      stopEverything();
     }
   };
 
-  const stopLive = () => {
-    manualStopRef.current = true;
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = null;
-    }
-    if (segmentTimerRef.current) {
-      clearTimeout(segmentTimerRef.current);
-      segmentTimerRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    if (socketRef.current) {
-      // Give the backend a moment to return the last clip's result.
-      const socket = socketRef.current;
-      window.setTimeout(() => socket.close(), 1500);
-      socketRef.current = null;
-    }
-    setIsLive(false);
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    setError('');
+  const stopAudio = () => {
+    workletRef.current?.disconnect();
+    workletRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    audioContextRef.current?.close().catch(() => {});
+    audioContextRef.current = null;
   };
+
+  function stopEverything() {
+    liveRef.current = false;
+    clearInterval(timerRef.current);
+    clearInterval(pingRef.current);
+    stopAudio();
+    const socket = socketRef.current;
+    socketRef.current = null;
+    socket?.close();
+    setIsLive(false);
+    setStatus('idle');
+  }
+
+  const stopLive = () => {
+    liveRef.current = false;
+    clearInterval(timerRef.current);
+    clearInterval(pingRef.current);
+    stopAudio();
+    setIsLive(false);
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      stopEverything();
+      return;
+    }
+    // Ask the server to finish the last sentence, then close once it is done.
+    setStatus('processing');
+    socket.send(JSON.stringify({ type: 'stop' }));
+    const finish = () => {
+      if (socketRef.current === socket) socketRef.current = null;
+      socket.close();
+      setStatus('idle');
+    };
+    const timeout = setTimeout(finish, 60000);
+    socket.onmessage = (event) => {
+      handleMessage(event);
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'status' && message.state === 'listening') {
+          clearTimeout(timeout);
+          finish();
+        }
+      } catch { /* ignore */ }
+    };
+  };
+
+  const statusInfo = STATUS[status] || STATUS.idle;
+  const hasText = segments.length > 0 || partial;
 
   return (
     <div className='container mt-5'>
@@ -311,66 +230,48 @@ function LiveTranslation() {
           <option value='English'>English</option>
         </select>
 
-        <div className='mb-3'>
-          <button
-            className='btn btn-primary me-2'
-            onClick={startLive}
-            disabled={isLive}
-          >
-            {isLive ? 'Live Translating...' : 'Translate Live'}
+        <div className='d-flex flex-wrap align-items-center gap-2 mb-3'>
+          <button className='btn btn-primary' onClick={startLive} disabled={isLive}>
+            {isLive ? 'Live translating…' : 'Start live translation'}
           </button>
-
-          <button
-            className='btn btn-danger'
-            onClick={stopLive}
-            disabled={!isLive}
-          >
-            Stop Live Translate
+          <button className='btn btn-danger' onClick={stopLive} disabled={!isLive}>
+            Stop
           </button>
+          <span className={`badge rounded-pill ms-md-2 px-3 py-2 ${statusInfo.className}`}>{statusInfo.label}</span>
+          {isLive && <span className='text-muted small'>{formatTime(elapsed)}</span>}
         </div>
 
-        {isLive && (
-          <div className='alert alert-info'>
-            <strong>Live translation active</strong> — elapsed time: {Math.floor(elapsedSeconds / 60)
-              .toString()
-              .padStart(2, '0')}:{(elapsedSeconds % 60).toString().padStart(2, '0')}
+        {(detectedLanguage || emergencyType !== 'Unknown') && (
+          <div className='d-flex flex-wrap gap-2 mb-3'>
+            {detectedLanguage && <span className='badge bg-info text-dark px-3 py-2'>Language: {detectedLanguage}</span>}
+            {emergencyType !== 'Unknown' && (
+              <span className='badge bg-danger px-3 py-2'>Emergency: {emergencyType}</span>
+            )}
           </div>
         )}
 
-        {liveResult ? (
-          <div className='card mt-4 shadow-lg border-0'>
-            <div className='card-body'>
-              <h4 className='fw-bold mb-4'>Real-time Translation Result</h4>
-              {liveResult.original_text && (
-                <div className='mb-3'>
-                  <strong>Original Text:</strong>
-                  <pre className='mt-2 p-2 bg-light border rounded' style={{ whiteSpace: 'pre-wrap', wordWrap: 'break-word' }}>
-                    {liveResult.original_text}
-                  </pre>
-                </div>
-              )}
-              {liveResult.detected_language && (
-                <p><strong>Detected Language:</strong> {liveResult.detected_language}</p>
-              )}
-              {liveResult.translated_text && (
-                <div className='mb-3'>
-                  <strong>Translated Text:</strong>
-                  <pre className='mt-2 p-2 bg-light border rounded' style={{ whiteSpace: 'pre-wrap', wordWrap: 'break-word' }}>
-                    {liveResult.translated_text}
-                  </pre>
-                </div>
-              )}
-              {liveResult.emergency_type && (
-                <p><strong>Emergency Type:</strong> {liveResult.emergency_type}</p>
-              )}
-            </div>
+        {hasText ? (
+          <div className='border rounded p-3 bg-light' style={{ maxHeight: '60vh', overflowY: 'auto' }}>
+            {segments.map((segment) => (
+              <div key={segment.id} className='mb-3 pb-2 border-bottom'>
+                <div dir='auto' className='fs-5'>{segment.text}</div>
+                <div className='text-primary'>{segment.translation}</div>
+              </div>
+            ))}
+            {partial && (
+              <div className='mb-2'>
+                <div dir='auto' className='fs-5 text-secondary fst-italic'>{partial.text}</div>
+                {partial.translation && <div className='text-primary opacity-75 fst-italic'>{partial.translation}</div>}
+              </div>
+            )}
+            <div ref={transcriptEndRef} />
           </div>
         ) : (
-          !error && (
-            <div className='mt-4'>
-              <p className='text-muted'>Real-time translation results will appear here once live translation starts.</p>
-            </div>
-          )
+          <p className='text-muted'>
+            {isLive
+              ? 'Speak now. Your words appear here as you talk, and the translation follows after each pause.'
+              : 'Press Start and speak. Choosing the caller\'s language gives the best results, especially for Pashto.'}
+          </p>
         )}
       </div>
     </div>

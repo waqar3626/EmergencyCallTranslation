@@ -11,7 +11,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only PyTorch (~200 MB). The default wheel pulls several GB of CUDA
+# libraries that this CPU-only service never uses.
+RUN pip install --no-cache-dir filelock typing-extensions sympy networkx jinja2 fsspec \
+    && pip install --no-cache-dir --no-deps torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY run.py .
