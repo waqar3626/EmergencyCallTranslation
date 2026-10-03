@@ -35,8 +35,11 @@ LANGUAGE_CODES = {
 
 # Whisper's language scores are summed over related languages: spoken Urdu is
 # usually labelled Hindi, and Pashto is often labelled Persian, Arabic or even
-# Marathi. On FLEURS, Urdu always scored >= 0.75 for the Urdu group, while
-# Pashto never scored more than 0.6 for it.
+# Marathi. Clean read Urdu (FLEURS) scores >= 0.75 for the Urdu group, but
+# Urdu from a laptop microphone often scores only 0.25-0.7 - while still far
+# ahead of the Pashto group. Urdu therefore wins on a high score or a clear
+# lead; Pashto needs real Pashto evidence; anything weaker is a low-confidence
+# guess between the two.
 LANGUAGE_GROUPS = {
     "ur": ("ur", "hi", "sd"),
     "ps": ("ps", "fa", "ar"),
@@ -44,6 +47,10 @@ LANGUAGE_GROUPS = {
     "en": ("en",),
 }
 URDU_THRESHOLD = 0.7
+URDU_MIN = 0.2
+URDU_LEAD = 3.0          # Urdu group must be this many times the Pashto group
+PASHTO_MIN = 0.2
+NO_EVIDENCE = 0.05       # below this for both groups the audio is noise or silence
 CONFIDENT = 0.5
 
 _models = {}
@@ -54,7 +61,11 @@ def _whisper(name):
     with _models_lock:
         if name not in _models:
             print(f"Loading Whisper model: {name}", flush=True)
-            _models[name] = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+            try:    # cached copy first (no network round trip), download only if missing
+                _models[name] = WhisperModel(name, device="cpu", compute_type="int8",
+                                             cpu_threads=CPU_THREADS, local_files_only=True)
+            except Exception:
+                _models[name] = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
         return _models[name]
 
 
@@ -109,24 +120,41 @@ def _collapse_repetitions(text: str):
     return " ".join(words)
 
 
-def detect_language_code(audio):
-    """Spoken language of the audio: 'ur', 'ps', 'pa' or 'en'."""
+def decide_language(scores):
+    """(language code, evidence) from grouped scores; evidence is 'strong',
+    'weak' or 'none' (noise or silence: no language stands out)."""
+    if scores["en"] >= CONFIDENT:
+        return "en", "strong"
+    if scores["pa"] >= CONFIDENT:
+        return "pa", "strong"
+    if scores["ur"] >= URDU_THRESHOLD or (
+            scores["ur"] >= URDU_MIN and scores["ur"] >= URDU_LEAD * scores["ps"]):
+        return "ur", "strong"
+    if scores["ps"] >= PASHTO_MIN and scores["ps"] >= scores["ur"]:
+        return "ps", "strong"
+    if max(scores["ur"], scores["ps"]) < NO_EVIDENCE:
+        # Nothing to go on: assume Urdu, the language most callers can speak.
+        return "ur", "none"
+    # Weak evidence (very short or unclear audio): best guess between the two.
+    return ("ur" if scores["ur"] >= scores["ps"] else "ps"), "weak"
+
+
+def detect_language_scored(audio):
+    """(language code, evidence) for the spoken language of the audio."""
     _, info = _whisper(LID_MODEL).transcribe(
         audio, vad_filter=True, vad_parameters={"min_speech_duration_ms": 250})
     probabilities = dict(info.all_language_probs or [])
     scores = {code: sum(probabilities.get(m, 0.0) for m in members)
               for code, members in LANGUAGE_GROUPS.items()}
-    if scores["en"] >= CONFIDENT:
-        best = "en"
-    elif scores["ur"] >= URDU_THRESHOLD:
-        best = "ur"
-    elif scores["pa"] >= CONFIDENT:
-        best = "pa"
-    else:
-        best = "ps"
-    print(f"Whisper detected '{info.language}', using '{best}' "
-          f"(scores: { {k: round(v, 3) for k, v in scores.items()} })", flush=True)
-    return best
+    best, evidence = decide_language(scores)
+    print(f"Whisper detected '{info.language}' on {len(audio) / SAMPLE_RATE:.1f}s, using '{best}' "
+          f"({evidence} evidence; scores: { {k: round(v, 3) for k, v in scores.items()} })", flush=True)
+    return best, evidence
+
+
+def detect_language_code(audio):
+    """Spoken language of the audio: 'ur', 'ps', 'pa' or 'en'."""
+    return detect_language_scored(audio)[0]
 
 
 def _whisper_transcribe(model, audio, language_code, beam_size):

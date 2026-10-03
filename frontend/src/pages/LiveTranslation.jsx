@@ -46,6 +46,7 @@ function LiveTranslation() {
   const liveRef = useRef(false);
   const reconnectsRef = useRef(0);
   const transcriptEndRef = useRef(null);
+  const connectionRef = useRef(0);          // sentence ids restart on every connection
 
   useEffect(() => () => stopEverything(), []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -72,12 +73,20 @@ function LiveTranslation() {
       if (message.detected_language) setDetectedLanguage(message.detected_language);
     } else if (message.type === 'final') {
       setPartial((previous) => (previous?.id === message.id ? null : previous));
-      if (message.text) {
+      const key = `${connectionRef.current}-${message.id}`;
+      if (message.replace) {
+        // The server re-recognised an earlier sentence (the language guess changed).
+        setSegments((previous) => (message.text
+          ? previous.map((s) => (s.id === key ? { ...s, text: message.text, translation: message.translation } : s))
+          : previous.filter((s) => s.id !== key)));
+      } else if (message.text) {
         setSegments((previous) => [...previous, {
-          id: `${Date.now()}-${message.id}`,
+          id: key,
           text: message.text,
           translation: message.translation,
         }]);
+      }
+      if (message.text) {
         setDetectedLanguage(message.detected_language || '');
         setEmergencyType(message.emergency_type || 'Unknown');
       }
@@ -87,6 +96,7 @@ function LiveTranslation() {
   };
 
   const connect = () => {
+    connectionRef.current += 1;
     const query = new URLSearchParams({ language: sourceLanguage });
     const socket = new WebSocket(`${websocketBase()}/ws/live-transcription?${query}`);
     socket.binaryType = 'arraybuffer';

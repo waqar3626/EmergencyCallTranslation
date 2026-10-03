@@ -21,6 +21,20 @@ CPU_THREADS = int(os.getenv("CPU_THREADS", "0")) or max(1, (os.cpu_count() or 2)
 WINDOW_SECONDS = 20
 
 
+def model_path(repo_id):
+    """Local folder of a Hugging Face model. The local cache is used first, so a
+    slow or unreachable Hugging Face server cannot hold up start-up; the model
+    is only downloaded when it is not cached yet."""
+    if os.path.isdir(repo_id):
+        return repo_id
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(repo_id, local_files_only=True)
+    except Exception:
+        print(f"Downloading model {repo_id}", flush=True)
+        return snapshot_download(repo_id)
+
+
 class PashtoCTC:
     """Pashto speech recognition with a fine-tuned w2v-BERT 2.0 CTC model."""
 
@@ -30,8 +44,9 @@ class PashtoCTC:
 
         self._torch = torch
         torch.set_num_threads(CPU_THREADS)
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        model = Wav2Vec2BertForCTC.from_pretrained(model_name)
+        path = model_path(model_name)
+        self.processor = AutoProcessor.from_pretrained(path)
+        model = Wav2Vec2BertForCTC.from_pretrained(path)
         model.eval()
         # int8 weights for the linear layers: about twice as fast on a CPU and
         # a quarter of the memory. Free the float32 original straight away.

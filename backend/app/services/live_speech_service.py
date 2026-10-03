@@ -12,6 +12,11 @@ quick translation) are sent so text appears as they talk. When they pause, the
 utterance is transcribed again, translated with full quality and added to the
 call. During silence nothing is processed, so the session simply waits.
 
+In automatic mode the language is not fixed by the first utterance (a short
+greeting such as "Assalam alaikum" sounds Arabic). It is re-detected over all
+speech so far until the evidence is strong and long enough; if the decision
+changes, the sentences already shown are recognised again and replaced.
+
 All model work runs on one worker thread per call; final results always take
 priority and stale partial results are dropped, so the delay cannot build up.
 """
@@ -24,7 +29,7 @@ from faster_whisper.vad import get_vad_model
 
 from app.services.classification_service import classify_emergency
 from app.services.language_service import detect_language
-from app.services.speech_service import SAMPLE_RATE, detect_language_code, language_code_for, transcribe
+from app.services.speech_service import SAMPLE_RATE, detect_language_scored, language_code_for, transcribe
 from app.services.translation_service import translate_text
 
 FRAME = 512                                   # Silero VAD frame: 32 ms
@@ -39,6 +44,13 @@ PARTIAL_INTERVAL_SECONDS = 1.2
 PARTIAL_TRANSLATION_INTERVAL_SECONDS = 4.0
 MIN_PARTIAL_SECONDS = 0.8
 VAD_HISTORY_FRAMES = 16                       # context given to the VAD per call
+LID_LOCK_SECONDS = 5.0                        # strong decision on this much speech: keep it
+LID_FORCE_LOCK_SECONDS = 15.0                 # keep the decision after this much speech anyway
+LID_WINDOW_SECONDS = 30.0                     # Whisper only looks at 30 s
+MIN_PARTIAL_LID_SECONDS = 1.5
+PARTIAL_RECHECK_SECONDS = 4.0                 # long utterance with a provisional language: check it once
+MIN_LID_UTTERANCE_SECONDS = 1.0               # shorter bursts are mostly noise: ignore them for detection
+MIN_FINAL_SECONDS = 0.5                       # shorter utterances are not transcribed
 
 LANGUAGE_NAMES = {"ur": "Urdu", "ps": "Pashto", "pa": "Punjabi", "en": "English"}
 
@@ -60,7 +72,11 @@ class LiveSession:
         """send(message: dict) is called from the worker thread; it must be thread-safe."""
         self.send = send
         self.language_code = language_code_for(source_language)
-        self.segments = []                    # finished utterances: (original, translation)
+        self._language_fixed = self.language_code is not None   # chosen by the operator or detected reliably
+        self._lid_audio = []                  # speech so far, while the language is still provisional
+        self._provisional = {}                # utterance id -> (audio, language used), while provisional
+        self._rechecked = set()               # utterances whose partial text triggered a language check
+        self.segments = {}                    # utterance id -> (original, translation), in order
         self.emergency_type = "Unknown"
 
         self._pending = np.zeros(0, dtype=np.float32)
@@ -173,11 +189,44 @@ class LiveSession:
             self._state = state
             self.send({"type": "status", "state": state})
 
-    def _language(self, audio):
-        if self.language_code is None and len(audio) >= SAMPLE_RATE:
-            # Detect once, on the first utterance long enough, then keep it.
-            self.language_code = detect_language_code(audio)
+    def _partial_language(self, utterance_id, audio):
+        """Language for partial text: the current (possibly provisional) guess,
+        checked again once while a long utterance is still being spoken."""
+        seconds = len(audio) / SAMPLE_RATE
+        if self.language_code is None and seconds >= MIN_PARTIAL_LID_SECONDS:
+            code, evidence = detect_language_scored(audio)
+            if evidence != "none":
+                self.language_code = code
+        elif (not self._language_fixed and seconds >= PARTIAL_RECHECK_SECONDS
+                and utterance_id not in self._rechecked):
+            self._rechecked.add(utterance_id)
+            speech = np.concatenate(self._lid_audio + [audio])[-int(LID_WINDOW_SECONDS * SAMPLE_RATE):]
+            code, evidence = detect_language_scored(speech)
+            if evidence == "strong":
+                self.language_code = code       # still provisional; the final result decides
         return self.language_code
+
+    def _update_language(self, audio):
+        """Re-detect the language over all speech so far until the decision is reliable.
+        The language may change while it is provisional."""
+        if self._language_fixed or len(audio) < MIN_LID_UTTERANCE_SECONDS * SAMPLE_RATE:
+            if self.language_code is None:
+                self.language_code = "ur"       # provisional default until there is evidence
+            return
+        self._lid_audio.append(audio)
+        speech = np.concatenate(self._lid_audio)
+        seconds = len(speech) / SAMPLE_RATE
+        code, evidence = detect_language_scored(speech[-int(LID_WINDOW_SECONDS * SAMPLE_RATE):])
+        if evidence == "none":
+            # Noise or unclear audio says nothing about the language: keep the current guess.
+            if self.language_code is None:
+                self.language_code = code
+            return
+        if (evidence == "strong" and seconds >= LID_LOCK_SECONDS) or seconds >= LID_FORCE_LOCK_SECONDS:
+            self._language_fixed = True
+            self._lid_audio = []
+            print(f"Live language fixed: {code} after {seconds:.1f}s of speech", flush=True)
+        self.language_code = code
 
     def _run(self):
         while True:
@@ -203,7 +252,9 @@ class LiveSession:
                 self._set_state("listening")
 
     def _partial_result(self, utterance_id, audio):
-        language = self._language(audio)
+        language = self._partial_language(utterance_id, audio)
+        if language is None:
+            return          # too little speech to guess the language yet
         text, language = transcribe(audio, language, live=True, partial=True)
         if not text or utterance_id in self._finished:
             return
@@ -224,21 +275,41 @@ class LiveSession:
 
     def _final(self, utterance_id, audio):
         self._finished.add(utterance_id)
+        self._update_language(audio)
+        # Sentences shown with a different provisional language are recognised again.
+        stale = [(i, a) for i, (a, used) in self._provisional.items() if used != self.language_code]
+        if stale:
+            print(f"Live language is now {self.language_code}; re-recognising {len(stale)} earlier utterance(s)",
+                  flush=True)
+            for earlier_id, earlier_audio in stale:
+                self._provisional[earlier_id] = (earlier_audio, self.language_code)
+                self._process(earlier_id, earlier_audio, replace=True)
+        if self._language_fixed:
+            self._provisional.clear()
+        else:
+            self._provisional[utterance_id] = (audio, self.language_code)
+        self._process(utterance_id, audio)
+
+    def _process(self, utterance_id, audio, replace=False):
         started = time.monotonic()
-        language = self._language(audio)
-        text, language = transcribe(audio, language, live=True) if len(audio) >= SAMPLE_RATE // 3 else ("", language)
+        language = self.language_code
+        text, language = (transcribe(audio, language, live=True)
+                          if len(audio) >= MIN_FINAL_SECONDS * SAMPLE_RATE else ("", language))
+        if not any(len(word) >= 2 for word in text.split()):
+            text = ""       # single letters from noise ("س", "ک") are not speech
         recognised = time.monotonic()
         if not text:
-            self.send({"type": "final", "id": utterance_id, "text": "", "translation": ""})
+            self.segments.pop(utterance_id, None)
+            self.send({"type": "final", "id": utterance_id, "text": "", "translation": "", "replace": replace})
             return
         name = detect_language(text, language)
         translation = translate_text(text, name, live=True)
         print(f"Live utterance {utterance_id}: {len(audio) / SAMPLE_RATE:.1f}s audio, "
               f"recognition {recognised - started:.1f}s, translation {time.monotonic() - recognised:.1f}s", flush=True)
-        self.segments.append((text, translation))
-        all_original = " ".join(s[0] for s in self.segments)
-        all_translation = " ".join(s[1] for s in self.segments)
+        self.segments[utterance_id] = (text, translation)
+        all_original = " ".join(s[0] for s in self.segments.values())
+        all_translation = " ".join(s[1] for s in self.segments.values())
         self.emergency_type = classify_emergency(all_translation, all_original)
         print(f"Live utterance {utterance_id} ({language}): {text} -> {translation}", flush=True)
         self.send({"type": "final", "id": utterance_id, "text": text, "translation": translation,
-                   "detected_language": name, "emergency_type": self.emergency_type})
+                   "detected_language": name, "emergency_type": self.emergency_type, "replace": replace})

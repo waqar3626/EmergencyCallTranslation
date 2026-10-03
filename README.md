@@ -287,7 +287,7 @@ flowchart LR
 ```
 
 1. **Language detection** ([`speech_service.py`](backend/app/services/speech_service.py))
-   Whisper's language scores are summed over related languages: spoken Urdu is usually labelled *Hindi*, and Pashto is often labelled Persian, Arabic or even Marathi. The rule is: English if its score is at least 0.5, Urdu if the Urdu group is at least 0.7, Punjabi if it is at least 0.5, otherwise Pashto. On 30 FLEURS test recordings this identified **15/15 Urdu and 15/15 Pashto** clips, compared with 2/15 and 10/15 for Whisper's own guess. Choosing the language in the interface skips detection.
+   Whisper's language scores are summed over related languages: spoken Urdu is usually labelled *Hindi*, and Pashto is often labelled Persian, Arabic or even Marathi. The rule is: English or Punjabi if its score is at least 0.5; Urdu if the Urdu group is at least 0.7, or at least 0.2 and three times the Pashto group; Pashto if the Pashto group is at least 0.2 and ahead of Urdu. Anything weaker is a low-confidence guess between Urdu and Pashto, and noise or silence (both groups below 0.05) defaults to Urdu. Urdu from a laptop microphone often scores only 0.25-0.7 while still far ahead of Pashto, so a fixed Urdu threshold alone is not enough. On 30 FLEURS recordings the rule identified **15/15 Urdu and 12/15 Pashto** clips, and all 7 logged microphone sessions correctly (the previous Urdu-threshold-only rule: 15/15 and 15/15 on FLEURS, but only 2/7 on the microphone). Choosing the language in the interface skips detection.
 
 2. **Speech-to-text**: the best CPU-friendly model for each language.
 
@@ -310,6 +310,7 @@ flowchart LR
    - The browser streams the microphone continuously as 16 kHz PCM in 100 ms blocks.
    - The Silero voice activity detector finds where speech starts and stops. While the caller speaks, a fast model sends **partial text** about every 1.2 s, with a quick translation when the CPU is free. After a **0.7 s pause** the sentence is transcribed again, translated with full quality and added to the call.
    - During silence nothing is processed, so the session simply waits. There are no fixed-length clips and no timeouts.
+   - In automatic mode the language is not decided by the first utterance (a 1-2 s greeting such as *Assalam alaikum* sounds Arabic). It is re-detected over all speech so far and fixed after about 5 s of clear speech; if the decision changes, the sentences already shown are recognised again and replaced. Bursts shorter than 1 s (mostly noise) are ignored for detection.
    - One worker per call: finished sentences always take priority and out-of-date partial results are dropped, so the delay cannot build up.
 
 ## Tech stack

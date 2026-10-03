@@ -81,12 +81,11 @@ def _load_nllb():
             return None
         try:
             import ctranslate2
-            from huggingface_hub import snapshot_download
             from transformers import AutoTokenizer
 
+            from app.services.asr_engines import CPU_THREADS, model_path
             print(f"Loading translation model: {NLLB_MODEL}", flush=True)
-            path = NLLB_MODEL if os.path.isdir(NLLB_MODEL) else snapshot_download(NLLB_MODEL)
-            from app.services.asr_engines import CPU_THREADS
+            path = model_path(NLLB_MODEL)
             translator = ctranslate2.Translator(path, device="cpu", compute_type="int8",
                                                 inter_threads=1, intra_threads=CPU_THREADS)
             tokenizer = AutoTokenizer.from_pretrained(path)
